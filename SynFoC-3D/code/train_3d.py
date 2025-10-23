@@ -20,8 +20,8 @@ from utils.checkpoint import save_ckpt, load_ckpt
 from utils.metrics_3d import dice_per_class
 
 # 复用（请从你的 SynFoC 复制过来）
-from segment_anything.build_sam import build_sam_vit_b as build_sam  # 你也可换其它SAM变体
-# from sam_lora_image_encoder import build_sam_vit_b_lora  # 若你用LoRA版本，替换构造函数
+# from segment_anything.build_sam import build_sam_vit_b as build_sam  # 你也可换其它SAM变体
+from sam_lora_image_encoder import build_sam_vit_b_lora as build_sam  # 若你用LoRA版本，替换构造函数
 
 def setup_seed(seed=42):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -236,3 +236,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
