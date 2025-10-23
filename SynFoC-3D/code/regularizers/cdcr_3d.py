@@ -18,11 +18,7 @@ def _sobel_kernels_3d(device):
     kx = kx.view(1,1,3,3,3); ky = ky.view(1,1,3,3,3); kz = kz.view(1,1,3,3,3)
     return kx, ky, kz
 
-def edge_grad_3d(x):
-    """
-    x: [B,1,D,H,W] (前景概率/边界图)
-    return: gradient magnitude [B,1,D,H,W]
-    """
+def _edge_grad_single(x):
     B,_,D,H,W = x.shape
     kx,ky,kz = _sobel_kernels_3d(x.device)
     gx = F.conv3d(x, kx, padding=1)
@@ -43,10 +39,13 @@ def cdcr_loss_3d(p_sam3d, p_vnet3d, w_edge=1.0, w_kl=1.0):
     l_kl = kl_sv + kl_vs
 
     # 边界一致
-    ps = p_sam3d[:,1:2]   # 假定二类时用前景通道；多类可对每类取 max 边界或求和
-    pv = p_vnet3d[:,1:2]
-    es = edge_grad_3d(ps)
-    ev = edge_grad_3d(pv)
+    grads_s = []
+    grads_v = []
+    for c in range(p_sam3d.shape[1]):
+        grads_s.append(_edge_grad_single(p_sam3d[:, c:c+1]))
+        grads_v.append(_edge_grad_single(p_vnet3d[:, c:c+1]))
+    es = torch.cat(grads_s, dim=1)
+    ev = torch.cat(grads_v, dim=1)
     l_edge = F.l1_loss(es, ev)
 
     return w_edge*l_edge + w_kl*l_kl

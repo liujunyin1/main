@@ -12,8 +12,14 @@ class VNet3D(nn.Module):
     def __init__(self, in_ch=1, out_ch=2):
         super().__init__()
         try:
-            from models.networks.hierarchical_vnet import HierarchicalVNet
-            self.net = HierarchicalVNet(in_channels=in_ch, num_classes=out_ch)
+            from models.networks.hierarchical_vnet import VNet
+            self.net = VNet(
+                n_channels=in_ch,
+                n_classes=out_ch,
+                normalization='batchnorm',
+                has_dropout=True,
+                pyramid_has_dropout=True,
+            )
             self.returns_logits = True
         except Exception:
             # 兜底：简单3D UNet（若SFR不可用），确保项目可直接跑通
@@ -33,4 +39,6 @@ class VNet3D(nn.Module):
 
     def forward(self, x):
         out = self.net(x)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
         return out  # logits

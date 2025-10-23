@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
-import os, sys, argparse, time, json, math, random
-from datetime import datetime
+import copy
+import os
+import argparse
+import time
+import json
+import math
+import random
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import autocast, GradScaler
 
 # 本项目模块
 from bridges.bridge_2d3d import slice_volume_to_tiles, tiles_to_volume
+from bridges.sam_segmenter import SAM2DSegmenter
 from networks.vnet_adapter import VNet3D
 from smc.smc_3d import smc_fuse_3d
 from regularizers.cdcr_3d import cdcr_loss_3d
@@ -19,9 +24,8 @@ from utils.logging_utils import create_logger
 from utils.checkpoint import save_ckpt, load_ckpt
 from utils.metrics_3d import dice_per_class
 
-# 复用（请从你的 SynFoC 复制过来）
-# from segment_anything.build_sam import build_sam_vit_b as build_sam  # 你也可换其它SAM变体
-from sam_lora_image_encoder import build_sam_vit_b_lora as build_sam  # 若你用LoRA版本，替换构造函数
+from segment_anything import sam_model_registry
+from sam_lora_image_encoder import LoRA_Sam
 
 def setup_seed(seed=42):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -40,6 +44,15 @@ def get_args():
     p.add_argument("--in_channels", type=int, default=1)
     p.add_argument("--patch_size", type=int, nargs=3, default=[96,128,128])
     p.add_argument("--spacing", type=float, nargs=3, default=[1.5,1.0,1.0], help="resample spacing(mm), 若无需重采样可忽略")
+    p.add_argument("--num_workers", type=int, default=2, help="dataloader workers")
+    # SAM 设置
+    p.add_argument("--sam_model", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"])
+    p.add_argument("--sam_checkpoint", type=str, default="", help="SAM checkpoint 权重，可为空")
+    p.add_argument("--sam_image_size", type=int, default=1024)
+    p.add_argument("--sam_use_lora", action="store_true", help="对SAM图像编码器启用LoRA微调")
+    p.add_argument("--sam_lora_rank", type=int, default=4)
+    p.add_argument("--sam_pixel_mean", type=float, nargs=3, default=[0.0, 0.0, 0.0])
+    p.add_argument("--sam_pixel_std", type=float, nargs=3, default=[1.0, 1.0, 1.0])
     # 训练
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--train_bs", type=int, default=1)
@@ -83,7 +96,8 @@ def build_dataloaders(args):
         spacing=tuple(args.spacing),
         batch_size_l=args.train_bs,
         batch_size_u=args.train_bs,   # 这里简单设置一致
-        batch_size_v=args.val_bs
+        batch_size_v=args.val_bs,
+        num_workers=args.num_workers
     )
 
 def main():
@@ -102,13 +116,37 @@ def main():
     # ===== 模型（学生与教师）=====
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # SAM 2D
-    sam_student = build_sam(checkpoint=None).to(device)
-    sam_teacher = build_sam(checkpoint=None).to(device)
-    for p in sam_teacher.parameters(): p.requires_grad = False
+    multimask_output = args.num_classes > 1
+    sam_constructor = sam_model_registry[args.sam_model]
+    logger.info(f"Building SAM backbone={args.sam_model}, image_size={args.sam_image_size}")
+    sam_checkpoint = args.sam_checkpoint if args.sam_checkpoint else None
+    sam_kwargs = dict(
+        image_size=args.sam_image_size,
+        num_classes=args.num_classes,
+        pixel_mean=list(args.sam_pixel_mean),
+        pixel_std=list(args.sam_pixel_std),
+        checkpoint=sam_checkpoint,
+    )
+    sam_base, _ = sam_constructor(**sam_kwargs)
+    if sam_checkpoint:
+        logger.info(f"Loaded SAM checkpoint from {sam_checkpoint}")
+    if args.sam_use_lora:
+        logger.info(f"SAM uses LoRA rank={args.sam_lora_rank}")
+        sam_student_core = LoRA_Sam(sam_base, args.sam_lora_rank)
+    else:
+        sam_student_core = sam_base
+    sam_teacher_core = copy.deepcopy(sam_student_core)
+    sam_student = SAM2DSegmenter(sam_student_core, args.sam_image_size, multimask_output).to(device)
+    sam_teacher = SAM2DSegmenter(sam_teacher_core, args.sam_image_size, multimask_output).to(device)
+    sam_teacher.eval()
+    for p in sam_teacher.parameters():
+        p.requires_grad = False
     # VNet 3D（SFR 的模型包装）
     vnet_student = VNet3D(in_ch=args.in_channels, out_ch=args.num_classes).to(device)
     vnet_teacher = VNet3D(in_ch=args.in_channels, out_ch=args.num_classes).to(device)
-    for p in vnet_teacher.parameters(): p.requires_grad = False
+    vnet_teacher.eval()
+    for p in vnet_teacher.parameters():
+        p.requires_grad = False
 
     # 优化器
     params = list(vnet_student.parameters()) + [p for p in sam_student.parameters() if p.requires_grad]
@@ -148,7 +186,7 @@ def main():
             with autocast(enabled=args.amp):
                 # ----- 教师在 Uw（弱增）上预测 -----
                 # SAM 教师：Uw 3D→2D 大图
-                uw_big, meta_u = slice_volume_to_tiles(uw, tile_cols=args.tile_cols)
+                uw_big, meta_u = slice_volume_to_tiles(uw, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
                 with torch.no_grad():
                     samT_logits_2d = sam_teacher(uw_big)             # 假定返回 logits [B,C,H*,W*]
                 samT_logits_3d = tiles_to_volume(samT_logits_2d, meta_u)
@@ -166,7 +204,7 @@ def main():
                 pseudo_argmax = p_en_3d.argmax(1).detach()
 
                 # ----- 学生在 Uc（无标-强/中增）-----
-                uc_big, meta_c = slice_volume_to_tiles(uc, tile_cols=args.tile_cols)
+                uc_big, meta_c = slice_volume_to_tiles(uc, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
                 samS_logits_2d = sam_student(uc_big)
                 samS_logits_3d = tiles_to_volume(samS_logits_2d, meta_c)
                 vnetS_logits_3d = vnet_student(uc)
@@ -181,7 +219,7 @@ def main():
                 L_cdcr = cdcr_loss_3d(ps3d, pv3d)
 
                 # ----- 有标弱增监督（Xw） -----
-                x_big, meta_x = slice_volume_to_tiles(xb, tile_cols=args.tile_cols)
+                x_big, meta_x = slice_volume_to_tiles(xb, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
                 sam_logits_x_2d = sam_student(x_big)
                 sam_logits_x_3d = tiles_to_volume(sam_logits_x_2d, meta_x)
                 vnet_logits_x_3d = vnet_student(xb)
