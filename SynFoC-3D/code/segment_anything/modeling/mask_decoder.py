@@ -99,13 +99,17 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
         )
 
-        # Select the correct mask or masks for output
-        # if multimask_output:
-        #     mask_slice = slice(1, None)
-        # else:
-        #     mask_slice = slice(0, 1)
-        # masks = masks[:, mask_slice, :, :]
-        # iou_pred = iou_pred[:, mask_slice]
+        # Select the correct mask or masks for output.  SAM produces one
+        # "best" mask followed by ``num_multimask_outputs`` alternatives.  In
+        # the 3D pipeline we interpret the alternatives as per-class logits, so
+        # we must drop the first mask to keep the channel dimension equal to the
+        # requested class count.
+        if multimask_output:
+            mask_slice = slice(1, 1 + self.num_multimask_outputs)
+        else:
+            mask_slice = slice(0, 1)
+        masks = masks[:, mask_slice, :, :]
+        iou_pred = iou_pred[:, mask_slice]
 
         # Prepare output
         return masks, iou_pred
