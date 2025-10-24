@@ -27,6 +27,9 @@ def _split_double_ext(filename: str) -> Tuple[str, str]:
     return base, ext
 
 
+_SIBLING_HINTS = ("data", "dataset", "datasets", "database")
+
+
 def _iter_roots(base_dir: str) -> Iterable[str]:
     base_dir = os.path.abspath(base_dir)
     seen = set()
@@ -52,6 +55,19 @@ def _iter_roots(base_dir: str) -> Iterable[str]:
             break
         for item in _add(os.path.join(parent, base_name)):
             yield item
+
+        # Some datasets live in sibling directories such as ``../data`` while
+        # the index files stay inside the repository checkout.  Walk a small set
+        # of heuristically common sibling names so we can discover layouts such
+        # as ``../data/ACDC/database`` automatically.
+        for hint in _SIBLING_HINTS:
+            sibling = os.path.join(parent, hint)
+            if not os.path.isdir(sibling):
+                continue
+            for item in _add(sibling):
+                yield item
+            for item in _add(os.path.join(sibling, base_name)):
+                yield item
         cursor = parent
 
     # Allow users to override the search root via environment variables.  A
