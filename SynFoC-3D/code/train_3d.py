@@ -160,6 +160,10 @@ def build_dataloaders(args):
 
 def main():
     args = get_args()
+    # 兼容旧脚本/外部调用可能未传递 log_interval 参数的情况
+    if not hasattr(args, "log_interval"):
+        setattr(args, "log_interval", 10)
+
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     setup_seed(args.seed)
     os.makedirs(os.path.join(args.outdir, args.exp_name), exist_ok=True)
