@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+import glob
 import os
-from typing import Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
@@ -9,6 +10,11 @@ from scipy.ndimage import zoom
 from torch.utils.data import DataLoader, Dataset
 
 from .augs_3d import strong_aug_3d, weak_aug_3d
+
+
+_PATH_CACHE: Dict[Tuple[str, str, Optional[str]], str] = {}
+_MISSING = object()
+_STEM_CACHE: Dict[Tuple[str, str], Optional[str]] = {}
 
 
 def _split_double_ext(filename: str) -> Tuple[str, str]:
@@ -21,6 +27,54 @@ def _split_double_ext(filename: str) -> Tuple[str, str]:
     return base, ext
 
 
+def _iter_roots(base_dir: str) -> Iterable[str]:
+    base_dir = os.path.abspath(base_dir)
+    seen = set()
+
+    def _add(candidate: str):
+        if not candidate:
+            return
+        candidate = os.path.abspath(candidate)
+        if candidate not in seen:
+            seen.add(candidate)
+            yield candidate
+
+    base_name = os.path.basename(base_dir)
+
+    # Current directory and a few ancestors are useful when the actual data
+    # lives outside the repo checkout (e.g. ``../data`` or a mounted drive).
+    cursor = base_dir
+    for _ in range(4):
+        for item in _add(cursor):
+            yield item
+        parent = os.path.dirname(cursor)
+        if parent == cursor:
+            break
+        for item in _add(os.path.join(parent, base_name)):
+            yield item
+        cursor = parent
+
+    # Allow users to override the search root via environment variables.  A
+    # colon/semicolon separated list is supported to cover Unix/Windows shells.
+    for key in (
+        "SYNCF3D_DATA_ROOT",
+        "SYNCFOC3D_DATA_ROOT",
+        "SYNCFOC_DATA_ROOT",
+        "SYNFOC3D_DATA_ROOT",
+    ):
+        env = os.environ.get(key)
+        if not env:
+            continue
+        for chunk in env.split(os.pathsep):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            for item in _add(chunk):
+                yield item
+            for item in _add(os.path.join(chunk, base_name)):
+                yield item
+
+
 def _resolve_path(path: str, base_dir: str, suffix: Optional[str] = None) -> str:
     """Normalise dataset paths so index files work cross-platform.
 
@@ -29,44 +83,92 @@ def _resolve_path(path: str, base_dir: str, suffix: Optional[str] = None) -> str
     both Linux and Windows without forcing users to edit the index files.
     """
 
+    key = (os.path.abspath(base_dir), path, suffix)
+    cached = _PATH_CACHE.get(key)
+    if cached:
+        return cached
+
     cleaned = path.strip().replace("\\", "/")
     if not cleaned:
+        _PATH_CACHE[key] = cleaned
         return cleaned
+
+    suffix = suffix.strip() if suffix else ""
+
+    roots = list(_iter_roots(base_dir))
+    last = os.path.normpath(cleaned if os.path.isabs(cleaned) else os.path.join(base_dir, cleaned))
+
+    def _candidates_for(root: str):
+        # ``cleaned`` may already be absolute; otherwise treat it relative to
+        # the candidate root.
+        if os.path.isabs(cleaned):
+            guess = cleaned
+        else:
+            guess = os.path.join(root, cleaned)
+        yield guess
+        if suffix:
+            if not guess.endswith(suffix):
+                yield guess + suffix
+                base_guess, ext_guess = os.path.splitext(guess)
+                if ext_guess and suffix.startswith(ext_guess):
+                    yield base_guess + suffix
+
+    for root in roots:
+        for cand in _candidates_for(root):
+            norm = os.path.normpath(cand)
+            if os.path.isfile(norm):
+                _PATH_CACHE[key] = norm
+                return norm
+            last = norm
+
+    # Fallback 1: try to locate the relative path anywhere under the candidate
+    # roots.  This covers layouts such as ``database/training`` that are not
+    # encoded in the index file paths.
     if not os.path.isabs(cleaned):
-        cleaned = os.path.join(base_dir, cleaned)
+        rel_os = cleaned.replace("/", os.sep)
+        rel_variants = [rel_os]
+        if suffix and not rel_os.endswith(suffix):
+            rel_variants.append(rel_os + suffix)
+            base_rel, ext_rel = os.path.splitext(rel_os)
+            if ext_rel and suffix.startswith(ext_rel):
+                rel_variants.append(base_rel + suffix)
+        for root in roots:
+            if not os.path.isdir(root):
+                continue
+            for variant in rel_variants:
+                pattern = os.path.join(root, "**", variant)
+                matches = glob.glob(pattern, recursive=True)
+                if matches:
+                    norm = os.path.normpath(matches[0])
+                    _PATH_CACHE[key] = norm
+                    return norm
 
-    candidates = [cleaned]
-    if suffix:
-        suffix = suffix.strip()
-        if suffix and not cleaned.endswith(suffix):
-            candidates.append(cleaned + suffix)
-            base, ext = os.path.splitext(cleaned)
-            if ext and suffix.startswith(ext):
-                candidates.append(base + suffix)
-
-    seen = set()
-    for cand in candidates:
-        if cand in seen:
-            continue
-        seen.add(cand)
-        norm = os.path.normpath(cand)
-        if os.path.isfile(norm):
-            return norm
-        last = norm
-
-    # Fallback: search sibling files that share the same stem regardless of the
-    # extension so ``.nii`` indices can locate ``.nii.gz`` files and vice versa.
-    dirname, filename = os.path.split(cleaned)
-    if not dirname:
-        dirname = base_dir
+    # Fallback 2: search by stem so ``.nii`` ↔ ``.nii.gz`` mismatches are
+    # resolved even when the directory hierarchy differs.
+    filename = os.path.basename(cleaned)
     stem, _ = _split_double_ext(filename)
-    if os.path.isdir(dirname):
-        for entry in os.listdir(dirname):
-            entry_stem, _ = _split_double_ext(entry)
-            if entry_stem == stem:
-                candidate = os.path.join(dirname, entry)
-                if os.path.isfile(candidate):
-                    return os.path.normpath(candidate)
+    for root in roots:
+        cache_key = (root, stem)
+        cached_stem = _STEM_CACHE.get(cache_key, _MISSING)
+        if cached_stem is _MISSING:
+            if not os.path.isdir(root):
+                _STEM_CACHE[cache_key] = None
+                continue
+            for dirpath, _, filenames in os.walk(root):
+                for entry in filenames:
+                    entry_stem, _ = _split_double_ext(entry)
+                    if entry_stem == stem:
+                        resolved = os.path.normpath(os.path.join(dirpath, entry))
+                        _STEM_CACHE[cache_key] = resolved
+                        _PATH_CACHE[key] = resolved
+                        return resolved
+            _STEM_CACHE[cache_key] = None
+            cached_stem = None
+        if cached_stem:
+            _PATH_CACHE[key] = cached_stem
+            return cached_stem
+
+    _PATH_CACHE[key] = last
     return last
 
 
