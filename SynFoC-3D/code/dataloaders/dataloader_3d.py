@@ -11,7 +11,58 @@ from torch.utils.data import DataLoader, Dataset
 from .augs_3d import strong_aug_3d, weak_aug_3d
 
 
+def _resolve_path(path: str, base_dir: str, suffix: Optional[str] = None) -> str:
+    """Normalise dataset paths so index files work cross-platform.
+
+    Besides fixing Windows separators, dataset indices sometimes omit the file
+    suffix (``.nii.gz``).  We try a few suffix candidates so the loader works on
+    both Linux and Windows without forcing users to edit the index files.
+    """
+
+    cleaned = path.strip().replace("\\", "/")
+    if not cleaned:
+        return cleaned
+    if not os.path.isabs(cleaned):
+        cleaned = os.path.join(base_dir, cleaned)
+
+    candidates = [cleaned]
+    if suffix:
+        suffix = suffix.strip()
+        if suffix and not cleaned.endswith(suffix):
+            candidates.append(cleaned + suffix)
+            base, ext = os.path.splitext(cleaned)
+            if ext and suffix.startswith(ext):
+                candidates.append(base + suffix)
+
+    seen = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        norm = os.path.normpath(cand)
+        if os.path.isfile(norm):
+            return norm
+        last = norm
+    return last
+
+
 def _read_vol(path: str) -> Tuple[np.ndarray, Optional[Tuple[float, float, float]]]:
+    """Read a volume from ``path`` and return channel-first data with spacing.
+
+    The datasets we support may store 3D data in a variety of layouts:
+
+    * ``(D, H, W)`` single-channel volumes.
+    * ``(C, D, H, W)`` channel-first tensors saved via ``numpy``.
+    * ``(D, H, W, C)`` channel-last tensors produced by ``nibabel`` or other
+      medical imaging toolkits.
+
+    The previous implementation only handled the last case when the first
+    dimension was not 1 or 3, which broke common multi-modal datasets such as
+    BraTS (shape ``(H, W, D, 4)``) because the heuristic mis-identified the
+    channel axis.  Here we normalise by explicitly checking both ends and falling
+    back to moving the smallest dimension to the channel axis when ambiguous.
+    """
+
     spacing = None
     if path.endswith(".npy"):
         v = np.load(path)
@@ -19,12 +70,30 @@ def _read_vol(path: str) -> Tuple[np.ndarray, Optional[Tuple[float, float, float
         nii = nib.load(path)
         v = nii.get_fdata()
         spacing = tuple(float(s) for s in nii.header.get_zooms()[:3])
+
+    v = np.asarray(v)
+
     if v.ndim == 3:
-        v = v[None, ...]  # [C=1,D,H,W]
-    elif v.ndim == 4 and v.shape[0] not in [1, 3]:
-        # 例如 [D,H,W,C]
-        v = np.transpose(v, (3, 0, 1, 2))
-    return v, spacing
+        return v[None, ...], spacing  # [C=1,D,H,W]
+
+    if v.ndim != 4:
+        raise ValueError(f"Unsupported volume shape {v.shape} for {path}")
+
+    # Two common cases: channel already first (C,D,H,W) or last (D,H,W,C).
+    if v.shape[0] <= 4:
+        # Treat small first dimension as channels. Copy to avoid negative strides
+        # from nibabel proxy arrays when later torch.from_numpy is called.
+        return np.ascontiguousarray(v), spacing
+
+    if v.shape[-1] <= 4:
+        return np.ascontiguousarray(np.moveaxis(v, -1, 0)), spacing
+
+    # Ambiguous case: move the smallest dimension to the front as channels.
+    channel_axis = int(np.argmin(v.shape))
+    if channel_axis == 0:
+        return np.ascontiguousarray(v), spacing
+    return np.ascontiguousarray(np.moveaxis(v, channel_axis, 0)), spacing
+
 
 
 def _resample_to_spacing(
@@ -72,12 +141,15 @@ class LabeledSet3D(Dataset):
         augment: bool = True,
     ):
         self.items = []  # (image_path, label_path)
+        base_dir = os.path.dirname(os.path.abspath(index_file))
         with open(index_file, 'r') as f:
             for line in f:
-                line=line.strip()
-                if not line: continue
+                if not line.strip():
+                    continue
                 img_path, lab_path = line.split(",")
-                self.items.append((img_path.strip(), lab_path.strip()))
+                img_path = _resolve_path(img_path, base_dir, image_suffix)
+                lab_path = _resolve_path(lab_path, base_dir, image_suffix)
+                self.items.append((img_path, lab_path))
         self.patch = patch_size
         self.suffix = image_suffix
         self.spacing = spacing
@@ -121,10 +193,12 @@ class UnlabeledSet3D(Dataset):
         spacing: Optional[Tuple[float, float, float]],
     ):
         self.items = []
+        base_dir = os.path.dirname(os.path.abspath(index_file))
         with open(index_file, 'r') as f:
             for line in f:
-                p=line.strip()
-                if p: self.items.append(p)
+                resolved = _resolve_path(line, base_dir, image_suffix)
+                if resolved:
+                    self.items.append(resolved)
         self.patch = patch_size
         self.suffix = image_suffix
         self.spacing = spacing
