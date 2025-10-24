@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
+import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 
 # 本项目模块
@@ -28,8 +29,23 @@ from segment_anything import sam_model_registry
 from sam_lora_image_encoder import LoRA_Sam
 
 def setup_seed(seed=42):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     cudnn.benchmark, cudnn.deterministic = True, False
+
+
+def unwrap_state_dict(model: nn.Module):
+    if isinstance(model, nn.DataParallel):
+        return model.module.state_dict()
+    return model.state_dict()
+
+
+def load_state_dict(model: nn.Module, state):
+    target = model.module if isinstance(model, nn.DataParallel) else model
+    target.load_state_dict(state)
 
 def get_args():
     p = argparse.ArgumentParser("SynFoC-3D Training")
@@ -115,6 +131,7 @@ def main():
 
     # ===== 模型（学生与教师）=====
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    world_size = torch.cuda.device_count() if device.type == "cuda" else 0
     # SAM 2D
     multimask_output = args.num_classes > 1
     sam_constructor = sam_model_registry[args.sam_model]
@@ -148,6 +165,21 @@ def main():
     for p in vnet_teacher.parameters():
         p.requires_grad = False
 
+    multi_gpu = world_size > 1
+    if multi_gpu:
+        device_ids = list(range(world_size))
+        logger.info(f"Using DataParallel across {world_size} GPUs: {device_ids}")
+        sam_student = nn.DataParallel(sam_student, device_ids=device_ids)
+        sam_teacher = nn.DataParallel(sam_teacher, device_ids=device_ids)
+        vnet_student = nn.DataParallel(vnet_student, device_ids=device_ids)
+        vnet_teacher = nn.DataParallel(vnet_teacher, device_ids=device_ids)
+        sam_teacher.eval()
+        vnet_teacher.eval()
+        for p in sam_teacher.parameters():
+            p.requires_grad = False
+        for p in vnet_teacher.parameters():
+            p.requires_grad = False
+
     # 优化器
     params = list(vnet_student.parameters()) + [p for p in sam_student.parameters() if p.requires_grad]
     optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
@@ -161,10 +193,10 @@ def main():
     if args.resume and os.path.isfile(args.resume):
         logger.info(f"Loading ckpt: {args.resume}")
         ckpt = load_ckpt(args.resume, map_location=device)
-        sam_student.load_state_dict(ckpt["sam_student"])
-        sam_teacher.load_state_dict(ckpt["sam_teacher"])
-        vnet_student.load_state_dict(ckpt["vnet_student"])
-        vnet_teacher.load_state_dict(ckpt["vnet_teacher"])
+        load_state_dict(sam_student, ckpt["sam_student"])
+        load_state_dict(sam_teacher, ckpt["sam_teacher"])
+        load_state_dict(vnet_student, ckpt["vnet_student"])
+        load_state_dict(vnet_teacher, ckpt["vnet_teacher"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
@@ -264,10 +296,10 @@ def main():
             ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch:04d}.pth")
             save_ckpt(ckpt_path,
                       epoch=epoch, best_dice=best_dice,
-                      sam_student=sam_student.state_dict(),
-                      sam_teacher=sam_teacher.state_dict(),
-                      vnet_student=vnet_student.state_dict(),
-                      vnet_teacher=vnet_teacher.state_dict(),
+                      sam_student=unwrap_state_dict(sam_student),
+                      sam_teacher=unwrap_state_dict(sam_teacher),
+                      vnet_student=unwrap_state_dict(vnet_student),
+                      vnet_teacher=unwrap_state_dict(vnet_teacher),
                       optimizer=optimizer.state_dict(),
                       scaler=scaler.state_dict())
             logger.info(f"Saved: {ckpt_path}")
