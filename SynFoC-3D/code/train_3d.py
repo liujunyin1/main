@@ -88,6 +88,8 @@ def get_args():
     p.add_argument("--exp_name", type=str, default="default")
     p.add_argument("--resume", type=str, default="", help="从该 ckpt 路径恢复")
     p.add_argument("--save_interval", type=int, default=10)
+    p.add_argument("--log_interval", type=int, default=10,
+                   help="训练时每多少个 step 打印一次进度 (<=0 关闭)")
     p.add_argument("--seed", type=int, default=42)
     # 设备
     p.add_argument("--gpu", type=str, default="0")
@@ -204,6 +206,8 @@ def main():
         logger.info(f"Resumed from epoch={start_epoch}, best_dice={best_dice:.4f}")
 
     # ===== 训练 =====
+    total_steps = min(len(train_loader_l), len(train_loader_u))
+
     for epoch in range(start_epoch, args.epochs):
         sam_student.train(); vnet_student.train()
         t0 = time.time()
@@ -211,7 +215,7 @@ def main():
         epoch_loss, n_step = 0.0, 0
 
         # 将有标与无标 loader zip 到同一循环（按较小者长度）
-        for (xb, yb), (uw, uc) in zip(train_loader_l, train_loader_u):
+        for step, ((xb, yb), (uw, uc)) in enumerate(zip(train_loader_l, train_loader_u), start=1):
             xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True).long()
             uw, uc = uw.to(device, non_blocking=True), uc.to(device, non_blocking=True)
 
@@ -270,6 +274,12 @@ def main():
             update_ema(vnet_teacher, vnet_student, ema_m=args.ema_m)
 
             epoch_loss += loss.item(); n_step += 1
+
+            if args.log_interval > 0 and (step % args.log_interval == 0 or step == total_steps):
+                logger.info(
+                    f"Epoch {epoch:03d} | step {step:03d}/{total_steps:03d} | "
+                    f"loss={epoch_loss/max(1,n_step):.4f} | lambda_u={lambda_u:.3f}"
+                )
 
         # ===== 验证（可选）=====
         val_dice = 0.0
