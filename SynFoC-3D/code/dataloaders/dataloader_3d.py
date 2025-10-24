@@ -11,6 +11,16 @@ from torch.utils.data import DataLoader, Dataset
 from .augs_3d import strong_aug_3d, weak_aug_3d
 
 
+def _split_double_ext(filename: str) -> Tuple[str, str]:
+    """Split ``filename`` into stem and extension, handling ``.nii.gz`` etc."""
+
+    base, ext = os.path.splitext(filename)
+    if ext.lower() == ".gz":
+        base, ext2 = os.path.splitext(base)
+        ext = ext2 + ext
+    return base, ext
+
+
 def _resolve_path(path: str, base_dir: str, suffix: Optional[str] = None) -> str:
     """Normalise dataset paths so index files work cross-platform.
 
@@ -43,6 +53,20 @@ def _resolve_path(path: str, base_dir: str, suffix: Optional[str] = None) -> str
         if os.path.isfile(norm):
             return norm
         last = norm
+
+    # Fallback: search sibling files that share the same stem regardless of the
+    # extension so ``.nii`` indices can locate ``.nii.gz`` files and vice versa.
+    dirname, filename = os.path.split(cleaned)
+    if not dirname:
+        dirname = base_dir
+    stem, _ = _split_double_ext(filename)
+    if os.path.isdir(dirname):
+        for entry in os.listdir(dirname):
+            entry_stem, _ = _split_double_ext(entry)
+            if entry_stem == stem:
+                candidate = os.path.join(dirname, entry)
+                if os.path.isfile(candidate):
+                    return os.path.normpath(candidate)
     return last
 
 
