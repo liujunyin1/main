@@ -47,6 +47,46 @@ def load_state_dict(model: nn.Module, state):
     target = model.module if isinstance(model, nn.DataParallel) else model
     target.load_state_dict(state)
 
+
+@torch.no_grad()
+def _mean_dice(prob, target, num_classes):
+    return dice_per_class(prob, target, num_classes).mean().item()
+
+
+@torch.no_grad()
+def evaluate_models(val_loader, sam_model, vnet_model, device, args):
+    sam_model.eval()
+    vnet_model.eval()
+    sam_scores, vnet_scores, ens_scores = [], [], []
+    for xv, yv in val_loader:
+        xv = xv.to(device, non_blocking=True)
+        yv = yv.to(device, non_blocking=True).long()
+
+        x_big, meta = slice_volume_to_tiles(xv, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
+        sam_logits_2d = sam_model(x_big)
+        sam_logits_3d = tiles_to_volume(sam_logits_2d, meta)
+        vnet_logits_3d = vnet_model(xv)
+
+        prob_sam = torch.softmax(sam_logits_3d, dim=1)
+        prob_vnet = torch.softmax(vnet_logits_3d, dim=1)
+        prob_ens = 0.5 * (prob_sam + prob_vnet)
+
+        sam_scores.append(dice_per_class(prob_sam, yv, args.num_classes).cpu().numpy())
+        vnet_scores.append(dice_per_class(prob_vnet, yv, args.num_classes).cpu().numpy())
+        ens_scores.append(dice_per_class(prob_ens, yv, args.num_classes).cpu().numpy())
+
+    if not sam_scores:
+        return dict(sam=0.0, vnet=0.0, ensemble=0.0)
+
+    sam_scores = np.stack(sam_scores)
+    vnet_scores = np.stack(vnet_scores)
+    ens_scores = np.stack(ens_scores)
+    return dict(
+        sam=float(sam_scores.mean()),
+        vnet=float(vnet_scores.mean()),
+        ensemble=float(ens_scores.mean())
+    )
+
 def get_args():
     p = argparse.ArgumentParser("SynFoC-3D Training")
     # 数据
@@ -207,6 +247,13 @@ def main():
 
     # ===== 训练 =====
     total_steps = min(len(train_loader_l), len(train_loader_u))
+    global_step = start_epoch * total_steps
+    best_vnet = 0.0
+    best_vnet_iter = global_step
+    best_sam = 0.0
+    best_sam_iter = global_step
+    best_ensemble = best_dice
+    best_ensemble_iter = global_step
 
     for epoch in range(start_epoch, args.epochs):
         sam_student.train(); vnet_student.train()
@@ -239,6 +286,15 @@ def main():
                 )
                 pseudo_argmax = p_en_3d.argmax(1).detach()
 
+                with torch.no_grad():
+                    pv_teacher = torch.softmax(vnetT_logits_3d / args.vnet_T, dim=1)
+                    ps_teacher = torch.softmax(samT_logits_3d / args.sam_T, dim=1)
+                    agree = (pv_teacher.argmax(1) == ps_teacher.argmax(1)).float()
+                    mask_ratio = agree.mean().item()
+                    self_conf = pv_teacher.max(1).values.mean().item()
+                    mutual_conf = ps_teacher.max(1).values.mean().item()
+                    ratio = alpha.mean().item()
+
                 # ----- 学生在 Uc（无标-强/中增）-----
                 uc_big, meta_c = slice_volume_to_tiles(uc, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
                 samS_logits_2d = sam_student(uc_big)
@@ -264,6 +320,29 @@ def main():
 
                 loss = (Lx_sam + Lx_vnet) + lambda_u*(Lu_sam + Lu_vnet) + args.cdcr_w*L_cdcr
 
+            with torch.no_grad():
+                prob_sam_u = torch.softmax(samS_logits_3d, dim=1)
+                prob_vnet_u = torch.softmax(vnetS_logits_3d, dim=1)
+                sam_dice = _mean_dice(prob_sam_u, pseudo_argmax, args.num_classes)
+                vnet_dice = _mean_dice(prob_vnet_u, pseudo_argmax, args.num_classes)
+                ens_dice = _mean_dice(p_en_3d, pseudo_argmax, args.num_classes)
+
+            step_metrics = {
+                "loss": loss.detach().item(),
+                "sam_sup": Lx_sam.detach().item(),
+                "sam_unsup": Lu_sam.detach().item(),
+                "unet_sup": Lx_vnet.detach().item(),
+                "unet_unsup": Lu_vnet.detach().item(),
+                "cdcr": L_cdcr.detach().item(),
+                "mask_ratio": mask_ratio,
+                "self_conf": self_conf,
+                "mutual_conf": mutual_conf,
+                "ratio": ratio,
+                "sam_dice": sam_dice,
+                "unet_dice": vnet_dice,
+                "ens_dice": ens_dice,
+            }
+
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -274,38 +353,72 @@ def main():
             update_ema(vnet_teacher, vnet_student, ema_m=args.ema_m)
 
             epoch_loss += loss.item(); n_step += 1
+            current_iter = epoch * total_steps + step
 
             if args.log_interval > 0 and (step % args.log_interval == 0 or step == total_steps):
                 logger.info(
-                    f"Epoch {epoch:03d} | step {step:03d}/{total_steps:03d} | "
-                    f"loss={epoch_loss/max(1,n_step):.4f} | lambda_u={lambda_u:.3f}"
+                    "iteration %06d : loss : %.6f, sam_sup_loss : %.6f, sam_unsup_loss : %.6f, "
+                    "unet_sup_loss : %.6f, unet_unsup_loss : %.6f, cdcr_loss : %.6f, cons_w : %.6f, "
+                    "mask_ratio : %.6f, sd:%.6f,ud:%.6f,d:%.6f,s_m_r:%.6f,%.6f,%.6f"
+                    % (
+                        current_iter,
+                        step_metrics["loss"], step_metrics["sam_sup"], step_metrics["sam_unsup"],
+                        step_metrics["unet_sup"], step_metrics["unet_unsup"], step_metrics["cdcr"],
+                        lambda_u, step_metrics["mask_ratio"], step_metrics["sam_dice"],
+                        step_metrics["unet_dice"], step_metrics["ens_dice"], step_metrics["self_conf"],
+                        step_metrics["mutual_conf"], step_metrics["ratio"]
+                    )
+                )
+                logger.info(
+                    "sam_ulb_base_dice:%.6f, unet_ulb_base_dice:%.6f, ulb_base_dice:%.6f"
+                    % (
+                        step_metrics["sam_dice"], step_metrics["unet_dice"], step_metrics["ens_dice"]
+                    )
                 )
 
         # ===== 验证（可选）=====
+        global_step += total_steps
+        val_stats = dict(sam=0.0, vnet=0.0, ensemble=0.0)
         val_dice = 0.0
         if val_loader is not None:
-            sam_student.eval(); vnet_student.eval()
-            dices = []
-            with torch.no_grad():
-                for (xv, yv) in val_loader:
-                    xv, yv = xv.to(device), yv.to(device).long()
-                    # 直接用 VNet 学生评估；也可做 SAM 回拼评估
-                    logits = vnet_student(xv)
-                    prob = torch.softmax(logits, dim=1)
-                    dices.append(dice_per_class(prob, yv, num_classes=args.num_classes).cpu().numpy())
-            if len(dices)>0:
-                val_dice = float(np.mean(dices))
-                best_dice = max(best_dice, val_dice)
+            val_stats = evaluate_models(val_loader, sam_student, vnet_student, device, args)
+            val_dice = val_stats["ensemble"]
+            if val_stats["vnet"] > best_vnet:
+                best_vnet = val_stats["vnet"]
+                best_vnet_iter = global_step
+            if val_stats["sam"] > best_sam:
+                best_sam = val_stats["sam"]
+                best_sam_iter = global_step
+            if val_stats["ensemble"] > best_ensemble:
+                best_ensemble = val_stats["ensemble"]
+                best_ensemble_iter = global_step
+
+            logger.info("test unet model")
+            logger.info(f"epoch {epoch:03d} : loss : {epoch_loss/max(1,n_step):.6f}")
+            logger.info(f"\tval_base_dice: {val_stats['vnet']:.6f}")
+            logger.info(
+                "val_base_best_dice: %.6f at %d iter, val_best_avg_dice: %.6f at %d iter"
+                % (best_vnet, best_vnet_iter, best_ensemble, best_ensemble_iter)
+            )
+            logger.info("test sam model")
+            logger.info(f"epoch {epoch:03d} : loss : {epoch_loss/max(1,n_step):.6f}")
+            logger.info(f"\tval_base_dice: {val_stats['sam']:.6f}")
+            logger.info(
+                "stu_val_base_best_dice: %.6f at %d iter, val_best_avg_dice: %.6f at %d iter"
+                % (best_sam, best_sam_iter, best_ensemble, best_ensemble_iter)
+            )
 
         # ===== 日志 & 保存 =====
         dt = time.time()-t0
-        logger.info(f"Epoch {epoch:03d} | loss={epoch_loss/max(1,n_step):.4f} | val_dice={val_dice:.4f} | "
-                    f"lambda_u={lambda_u:.3f} | time={dt:.1f}s")
+        logger.info(
+            f"epoch {epoch:03d} : loss : {epoch_loss/max(1,n_step):.6f}"
+        )
+        logger.info(f"\tval_ensemble_dice: {val_dice:.6f}, lambda_u: {lambda_u:.6f}, time: {dt:.1f}s")
 
         if (epoch % args.save_interval == 0) or (epoch==args.epochs-1):
             ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch:04d}.pth")
             save_ckpt(ckpt_path,
-                      epoch=epoch, best_dice=best_dice,
+                      epoch=epoch, best_dice=best_ensemble,
                       sam_student=unwrap_state_dict(sam_student),
                       sam_teacher=unwrap_state_dict(sam_teacher),
                       vnet_student=unwrap_state_dict(vnet_student),
