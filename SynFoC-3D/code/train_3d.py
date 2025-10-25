@@ -1,0 +1,435 @@
+# -*- coding: utf-8 -*-
+import copy
+import os
+import argparse
+import time
+import json
+import math
+import random
+import numpy as np
+import torch
+import torch.optim as optim
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
+
+# 本项目模块
+from bridges.bridge_2d3d import slice_volume_to_tiles, tiles_to_volume
+from bridges.sam_segmenter import SAM2DSegmenter
+from networks.vnet_adapter import VNet3D
+from smc.smc_3d import smc_fuse_3d
+from regularizers.cdcr_3d import cdcr_loss_3d
+from losses.losses_3d import ce_dice_3d
+from utils.ema import update_ema
+from utils.logging_utils import create_logger
+from utils.checkpoint import save_ckpt, load_ckpt
+from utils.metrics_3d import dice_per_class
+
+from segment_anything import sam_model_registry
+from sam_lora_image_encoder import LoRA_Sam
+
+def setup_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    cudnn.benchmark, cudnn.deterministic = True, False
+
+
+def unwrap_state_dict(model: nn.Module):
+    if isinstance(model, nn.DataParallel):
+        return model.module.state_dict()
+    return model.state_dict()
+
+
+def load_state_dict(model: nn.Module, state):
+    target = model.module if isinstance(model, nn.DataParallel) else model
+    target.load_state_dict(state)
+
+
+@torch.no_grad()
+def _mean_dice(prob, target, num_classes):
+    return dice_per_class(prob, target, num_classes).mean().item()
+
+
+@torch.no_grad()
+def evaluate_models(val_loader, sam_model, vnet_model, device, args):
+    sam_model.eval()
+    vnet_model.eval()
+    sam_scores, vnet_scores, ens_scores = [], [], []
+    for xv, yv in val_loader:
+        xv = xv.to(device, non_blocking=True)
+        yv = yv.to(device, non_blocking=True).long()
+
+        x_big, meta = slice_volume_to_tiles(xv, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
+        sam_logits_2d = sam_model(x_big)
+        sam_logits_3d = tiles_to_volume(sam_logits_2d, meta)
+        vnet_logits_3d = vnet_model(xv)
+
+        prob_sam = torch.softmax(sam_logits_3d, dim=1)
+        prob_vnet = torch.softmax(vnet_logits_3d, dim=1)
+        prob_ens = 0.5 * (prob_sam + prob_vnet)
+
+        sam_scores.append(dice_per_class(prob_sam, yv, args.num_classes).cpu().numpy())
+        vnet_scores.append(dice_per_class(prob_vnet, yv, args.num_classes).cpu().numpy())
+        ens_scores.append(dice_per_class(prob_ens, yv, args.num_classes).cpu().numpy())
+
+    if not sam_scores:
+        return dict(sam=0.0, vnet=0.0, ensemble=0.0)
+
+    sam_scores = np.stack(sam_scores)
+    vnet_scores = np.stack(vnet_scores)
+    ens_scores = np.stack(ens_scores)
+    return dict(
+        sam=float(sam_scores.mean()),
+        vnet=float(vnet_scores.mean()),
+        ensemble=float(ens_scores.mean())
+    )
+    
+def get_args():
+    p = argparse.ArgumentParser("SynFoC-3D Training")
+    # 数据
+    p.add_argument("--labeled_list", type=str, required=True,
+                   help="标注数据索引(txt/csv)：每行 image_path,label_path")
+    p.add_argument("--unlabeled_list", type=str, required=True,
+                   help="无标注数据索引(txt)：每行 image_path")
+    p.add_argument("--val_list", type=str, default=None, help="验证集索引(可选)")
+    p.add_argument("--image_suffix", type=str, default=".nii.gz", help="数据后缀（.npy/.nii/.nii.gz）")
+    p.add_argument("--num_classes", type=int, default=2)
+    p.add_argument("--in_channels", type=int, default=1)
+    p.add_argument("--patch_size", type=int, nargs=3, default=[96,128,128])
+    p.add_argument("--spacing", type=float, nargs=3, default=[1.5,1.0,1.0], help="resample spacing(mm), 若无需重采样可忽略")
+    p.add_argument("--num_workers", type=int, default=2, help="dataloader workers")
+    # SAM 设置
+    p.add_argument("--sam_model", type=str, default="vit_b", choices=["vit_b", "vit_l", "vit_h"])
+    p.add_argument("--sam_checkpoint", type=str, default="", help="SAM checkpoint 权重，可为空")
+    p.add_argument("--sam_image_size", type=int, default=1024)
+    p.add_argument("--sam_use_lora", action="store_true", help="对SAM图像编码器启用LoRA微调")
+    p.add_argument("--sam_lora_rank", type=int, default=4)
+    p.add_argument("--sam_pixel_mean", type=float, nargs=3, default=[0.0, 0.0, 0.0])
+    p.add_argument("--sam_pixel_std", type=float, nargs=3, default=[1.0, 1.0, 1.0])
+    # 训练
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--train_bs", type=int, default=1)
+    p.add_argument("--val_bs", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--ema_m", type=float, default=0.999)
+    p.add_argument("--lambda_u_max", type=float, default=1.0)
+    p.add_argument("--cdcr_w", type=float, default=0.1)
+    p.add_argument("--sam_T", type=float, default=1.5, help="SMC：SAM 温度标定")
+    p.add_argument("--vnet_T", type=float, default=1.2, help="SMC：VNet 温度标定")
+    p.add_argument("--smc_mode", type=str, default="voxel", choices=["voxel"])
+    p.add_argument("--tile_cols", type=int, default=None, help="SAM大图网格列数，None自动开根")
+    p.add_argument("--amp", action="store_true", help="开启混合精度")
+    # 日志/断点
+    p.add_argument("--outdir", type=str, default="./runs/syncf_3d")
+    p.add_argument("--exp_name", type=str, default="default")
+    p.add_argument("--resume", type=str, default="", help="从该 ckpt 路径恢复")
+    p.add_argument("--save_interval", type=int, default=10)
+    p.add_argument("--seed", type=int, default=42)
+    # 设备
+    p.add_argument("--gpu", type=str, default="0")
+    return p.parse_args()
+
+def ramp_up(epoch, max_val, ramp_len=40):
+    if ramp_len <= 0: return max_val
+    if epoch >= ramp_len: return max_val
+    # sigmoid ramp (同 SynFoC/MeanTeacher 常用)
+    p = 1.0 - (epoch / ramp_len)
+    return max_val * math.exp(-5.0 * p * p)
+
+def build_dataloaders(args):
+    from dataloaders.dataloader_3d import build_semi_loaders
+    return build_semi_loaders(
+        labeled_list=args.labeled_list,
+        unlabeled_list=args.unlabeled_list,
+        val_list=args.val_list,
+        image_suffix=args.image_suffix,
+        in_channels=args.in_channels,
+        patch_size=tuple(args.patch_size),
+        spacing=tuple(args.spacing),
+        batch_size_l=args.train_bs,
+        batch_size_u=args.train_bs,   # 这里简单设置一致
+        batch_size_v=args.val_bs,
+        num_workers=args.num_workers
+    )
+
+def main():
+    args = get_args()
+        # 兼容旧脚本/外部调用可能未传递 log_interval 参数的情况
+    if not hasattr(args, "log_interval"):
+        setattr(args, "log_interval", 10)
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    setup_seed(args.seed)
+    os.makedirs(os.path.join(args.outdir, args.exp_name), exist_ok=True)
+    log_path = os.path.join(args.outdir, args.exp_name, "train.log")
+    logger = create_logger(log_path)
+    logger.info("Args:\n" + json.dumps(vars(args), indent=2))
+
+    # ===== 数据 =====
+    train_loader_l, train_loader_u, val_loader = build_dataloaders(args)
+    logger.info(f"Labeled iters/epoch={len(train_loader_l)}, Unlabeled iters/epoch={len(train_loader_u)}")
+
+    # ===== 模型（学生与教师）=====
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    world_size = torch.cuda.device_count() if device.type == "cuda" else 0
+    # SAM 2D
+    multimask_output = args.num_classes > 1
+    sam_constructor = sam_model_registry[args.sam_model]
+    logger.info(f"Building SAM backbone={args.sam_model}, image_size={args.sam_image_size}")
+    sam_checkpoint = args.sam_checkpoint if args.sam_checkpoint else None
+    sam_kwargs = dict(
+        image_size=args.sam_image_size,
+        num_classes=args.num_classes,
+        pixel_mean=list(args.sam_pixel_mean),
+        pixel_std=list(args.sam_pixel_std),
+        checkpoint=sam_checkpoint,
+    )
+    sam_base, _ = sam_constructor(**sam_kwargs)
+    if sam_checkpoint:
+        logger.info(f"Loaded SAM checkpoint from {sam_checkpoint}")
+    if args.sam_use_lora:
+        logger.info(f"SAM uses LoRA rank={args.sam_lora_rank}")
+        sam_student_core = LoRA_Sam(sam_base, args.sam_lora_rank)
+    else:
+        sam_student_core = sam_base
+    sam_teacher_core = copy.deepcopy(sam_student_core)
+    sam_student = SAM2DSegmenter(sam_student_core, args.sam_image_size, multimask_output).to(device)
+    sam_teacher = SAM2DSegmenter(sam_teacher_core, args.sam_image_size, multimask_output).to(device)
+    sam_teacher.eval()
+    for p in sam_teacher.parameters():
+        p.requires_grad = False
+    # VNet 3D（SFR 的模型包装）
+    vnet_student = VNet3D(in_ch=args.in_channels, out_ch=args.num_classes).to(device)
+    vnet_teacher = VNet3D(in_ch=args.in_channels, out_ch=args.num_classes).to(device)
+    vnet_teacher.eval()
+    for p in vnet_teacher.parameters():
+        p.requires_grad = False
+
+    multi_gpu = world_size > 1
+    if multi_gpu:
+        device_ids = list(range(world_size))
+        logger.info(f"Using DataParallel across {world_size} GPUs: {device_ids}")
+        sam_student = nn.DataParallel(sam_student, device_ids=device_ids)
+        sam_teacher = nn.DataParallel(sam_teacher, device_ids=device_ids)
+        vnet_student = nn.DataParallel(vnet_student, device_ids=device_ids)
+        vnet_teacher = nn.DataParallel(vnet_teacher, device_ids=device_ids)
+        sam_teacher.eval()
+        vnet_teacher.eval()
+        for p in sam_teacher.parameters():
+            p.requires_grad = False
+        for p in vnet_teacher.parameters():
+            p.requires_grad = False
+
+    # 优化器
+    params = list(vnet_student.parameters()) + [p for p in sam_student.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    scaler = GradScaler(enabled=args.amp)
+
+    start_epoch, best_dice = 0, 0.0
+    ckpt_dir = os.path.join(args.outdir, args.exp_name, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # ===== 恢复训练 =====
+    if args.resume and os.path.isfile(args.resume):
+        logger.info(f"Loading ckpt: {args.resume}")
+        ckpt = load_ckpt(args.resume, map_location=device)
+        load_state_dict(sam_student, ckpt["sam_student"])
+        load_state_dict(sam_teacher, ckpt["sam_teacher"])
+        load_state_dict(vnet_student, ckpt["vnet_student"])
+        load_state_dict(vnet_teacher, ckpt["vnet_teacher"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_dice = ckpt.get("best_dice", 0.0)
+        logger.info(f"Resumed from epoch={start_epoch}, best_dice={best_dice:.4f}")
+
+    # ===== 训练 =====
+    total_steps = min(len(train_loader_l), len(train_loader_u))
+    global_step = start_epoch * total_steps
+    best_vnet = 0.0
+    best_vnet_iter = global_step
+    best_sam = 0.0
+    best_sam_iter = global_step
+    best_ensemble = best_dice
+    best_ensemble_iter = global_step
+
+    for epoch in range(start_epoch, args.epochs):
+        sam_student.train(); vnet_student.train()
+        t0 = time.time()
+        lambda_u = ramp_up(epoch, max_val=args.lambda_u_max, ramp_len=40)
+        epoch_loss, n_step = 0.0, 0
+
+        # 将有标与无标 loader zip 到同一循环（按较小者长度）
+        for step, ((xb, yb), (uw, uc)) in enumerate(zip(train_loader_l, train_loader_u), start=1):
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True).long()
+            uw, uc = uw.to(device, non_blocking=True), uc.to(device, non_blocking=True)
+
+            with autocast(enabled=args.amp):
+                # ----- 教师在 Uw（弱增）上预测 -----
+                # SAM 教师：Uw 3D→2D 大图
+                uw_big, meta_u = slice_volume_to_tiles(uw, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
+                with torch.no_grad():
+                    samT_logits_2d = sam_teacher(uw_big)             # 假定返回 logits [B,C,H*,W*]
+                samT_logits_3d = tiles_to_volume(samT_logits_2d, meta_u)
+
+                # VNet 教师：Uw 3D
+                with torch.no_grad():
+                    vnetT_logits_3d = vnet_teacher(uw)
+
+                # ----- SMC 融合（3D 域）-----
+                p_en_3d, alpha = smc_fuse_3d(
+                    logits_vnet=vnetT_logits_3d,
+                    logits_sam3d=samT_logits_3d,
+                    T_v=args.vnet_T, T_s=args.sam_T, mode=args.smc_mode
+                )
+                pseudo_argmax = p_en_3d.argmax(1).detach()
+
+                with torch.no_grad():
+                    pv_teacher = torch.softmax(vnetT_logits_3d / args.vnet_T, dim=1)
+                    ps_teacher = torch.softmax(samT_logits_3d / args.sam_T, dim=1)
+                    agree = (pv_teacher.argmax(1) == ps_teacher.argmax(1)).float()
+                    mask_ratio = agree.mean().item()
+                    self_conf = pv_teacher.max(1).values.mean().item()
+                    mutual_conf = ps_teacher.max(1).values.mean().item()
+                    ratio = alpha.mean().item()
+
+                # ----- 学生在 Uc（无标-强/中增）-----
+                uc_big, meta_c = slice_volume_to_tiles(uc, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
+                samS_logits_2d = sam_student(uc_big)
+                samS_logits_3d = tiles_to_volume(samS_logits_2d, meta_c)
+                vnetS_logits_3d = vnet_student(uc)
+
+                # 无监督
+                Lu_sam  = ce_dice_3d(samS_logits_3d, pseudo_argmax)
+                Lu_vnet = ce_dice_3d(vnetS_logits_3d, pseudo_argmax)
+
+                # CDCR（3D 同域）：边界梯度一致 + 分布一致
+                samS_logits_3d_fp32 = samS_logits_3d.float()
+                vnetS_logits_3d_fp32 = vnetS_logits_3d.float()
+                ps3d = torch.softmax(samS_logits_3d_fp32, dim=1)
+                pv3d = torch.softmax(vnetS_logits_3d_fp32, dim=1)
+                L_cdcr = cdcr_loss_3d(ps3d, pv3d)
+
+                # ----- 有标弱增监督（Xw） -----
+                x_big, meta_x = slice_volume_to_tiles(xb, sam_input_size=args.sam_image_size, tile_cols=args.tile_cols)
+                sam_logits_x_2d = sam_student(x_big)
+                sam_logits_x_3d = tiles_to_volume(sam_logits_x_2d, meta_x)
+                vnet_logits_x_3d = vnet_student(xb)
+                Lx_sam  = ce_dice_3d(sam_logits_x_3d, yb)
+                Lx_vnet = ce_dice_3d(vnet_logits_x_3d, yb)
+
+                loss = (Lx_sam + Lx_vnet) + lambda_u*(Lu_sam + Lu_vnet) + args.cdcr_w*L_cdcr
+
+            with torch.no_grad():
+                prob_sam_u = torch.softmax(samS_logits_3d, dim=1)
+                prob_vnet_u = torch.softmax(vnetS_logits_3d, dim=1)
+                sam_dice = _mean_dice(prob_sam_u, pseudo_argmax, args.num_classes)
+                vnet_dice = _mean_dice(prob_vnet_u, pseudo_argmax, args.num_classes)
+                ens_dice = _mean_dice(p_en_3d, pseudo_argmax, args.num_classes)
+
+            step_metrics = {
+                "loss": loss.detach().item(),
+                "sam_sup": Lx_sam.detach().item(),
+                "sam_unsup": Lu_sam.detach().item(),
+                "vnet_sup": Lx_vnet.detach().item(),
+                "vnet_unsup": Lu_vnet.detach().item(),
+                "cdcr": L_cdcr.detach().item(),
+                "mask_ratio": mask_ratio,
+                "self_conf": self_conf,
+                "mutual_conf": mutual_conf,
+                "ratio": ratio,
+                "sam_dice": sam_dice,
+                "vnet_dice": vnet_dice,
+                "ens_dice": ens_dice,
+            }
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # EMA
+            update_ema(sam_teacher, sam_student, ema_m=args.ema_m)
+            update_ema(vnet_teacher, vnet_student, ema_m=args.ema_m)
+
+            epoch_loss += loss.item(); n_step += 1
+            current_iter = epoch * total_steps + step
+
+            if args.log_interval > 0 and (step % args.log_interval == 0 or step == total_steps):
+                logger.info(
+                    "iteration %06d : loss : %.6f, sam_sup_loss : %.6f, sam_unsup_loss : %.6f, "
+                    "vnet_sup_loss : %.6f, vnet_unsup_loss : %.6f, cdcr_loss : %.6f, cons_w : %.6f, "
+                    "mask_ratio : %.6f, sd:%.6f,ud:%.6f,d:%.6f,s_m_r:%.6f,%.6f,%.6f"
+                    % (
+                        current_iter,
+                        step_metrics["loss"], step_metrics["sam_sup"], step_metrics["sam_unsup"],
+                        step_metrics["vnet_sup"], step_metrics["vnet_unsup"], step_metrics["cdcr"],
+                        lambda_u, step_metrics["mask_ratio"], step_metrics["sam_dice"],
+                        step_metrics["vnet_dice"], step_metrics["ens_dice"], step_metrics["self_conf"],
+                        step_metrics["mutual_conf"], step_metrics["ratio"]
+                    )
+                )
+                logger.info(
+                    "sam_ulb_base_dice:%.6f, vnet_ulb_base_dice:%.6f, ulb_base_dice:%.6f"
+                    % (
+                        step_metrics["sam_dice"], step_metrics["vnet_dice"], step_metrics["ens_dice"]
+                    )
+                )
+
+        # ===== 验证（可选）=====
+        global_step += total_steps
+        val_stats = dict(sam=0.0, vnet=0.0, ensemble=0.0)
+        val_dice = 0.0
+        if val_loader is not None:
+            val_stats = evaluate_models(val_loader, sam_student, vnet_student, device, args)
+            val_dice = val_stats["ensemble"]
+            if val_stats["vnet"] > best_vnet:
+                best_vnet = val_stats["vnet"]
+                best_vnet_iter = global_step
+            if val_stats["sam"] > best_sam:
+                best_sam = val_stats["sam"]
+                best_sam_iter = global_step
+            if val_stats["ensemble"] > best_ensemble:
+                best_ensemble = val_stats["ensemble"]
+                best_ensemble_iter = global_step
+
+            logger.info("test vnet model")
+            logger.info(f"epoch {epoch:03d} : loss : {epoch_loss/max(1,n_step):.6f}")
+            logger.info(f"\tval_vnet_dice: {val_stats['vnet']:.6f}")
+            logger.info(
+                "val_vnet_best_dice: %.6f at %d iter, val_best_avg_dice: %.6f at %d iter"
+                % (best_vnet, best_vnet_iter, best_ensemble, best_ensemble_iter)
+            )
+            logger.info("test sam model")
+            logger.info(f"epoch {epoch:03d} : loss : {epoch_loss/max(1,n_step):.6f}")
+            logger.info(f"\tval_sam_dice: {val_stats['sam']:.6f}")
+            logger.info(
+                "stu_val_sam_best_dice: %.6f at %d iter, val_best_avg_dice: %.6f at %d iter"
+                % (best_sam, best_sam_iter, best_ensemble, best_ensemble_iter)
+            )
+
+        # ===== 日志 & 保存 =====
+        dt = time.time()-t0
+        logger.info(
+            f"epoch {epoch:03d} : loss : {epoch_loss/max(1,n_step):.6f}"
+        )
+        logger.info(f"\tval_ensemble_dice: {val_dice:.6f}, lambda_u: {lambda_u:.6f}, time: {dt:.1f}s")
+
+        if (epoch % args.save_interval == 0) or (epoch==args.epochs-1):
+            ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch:04d}.pth")
+            save_ckpt(ckpt_path,
+                      epoch=epoch, best_dice=best_ensemble,
+                      sam_student=unwrap_state_dict(sam_student),
+                      sam_teacher=unwrap_state_dict(sam_teacher),
+                      vnet_student=unwrap_state_dict(vnet_student),
+                      vnet_teacher=unwrap_state_dict(vnet_teacher),
+                      optimizer=optimizer.state_dict(),
+                      scaler=scaler.state_dict())
+            logger.info(f"Saved: {ckpt_path}")
+
+if __name__ == "__main__":
+    main()
