@@ -1,0 +1,292 @@
+/* style.qss - 现代卡片式分层主题 */
+
+/* 全局设置 */
+QWidget {
+    font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+    font-size: 14px;
+    color: #333333; /* 深色文本以保证对比度 */
+}
+
+/* Layer 0: 主窗口 (最底层背景) */
+QMainWindow {
+    background-color: #EAEFF2;
+/* 中性浅灰蓝背景 */
+}
+
+/* Layer 1: 顶部工具栏 (白色浮动层) */
+QToolBar {
+    background-color: #FFFFFF;
+    border-bottom: 1px solid #DDE2E5;
+/* 细边框用于分隔 */
+    padding: 4px;
+    spacing: 8px;
+}
+
+QToolBar QLabel {
+    background-color: transparent;
+    padding: 4px 2px;
+    border: none;
+    color: #334433;
+}
+
+/* 工具栏中的输入框 */
+QToolBar QSpinBox {
+    background-color: #FFFFFF;
+    border: 1px solid #DDE2E5;
+    padding: 4px;
+    min-width: 50px;
+    border-radius: 4px;
+}
+
+/* 工具栏按钮 */
+QToolBar QToolButton {
+    background-color: transparent;
+    padding: 4px;
+    border: none;
+    border-radius: 4px;
+}
+
+QToolBar QToolButton:hover {
+    background-color: #F0F2F5;
+/* 悬停背景 */
+}
+
+QToolBar QToolButton:pressed {
+    background-color: #E0E4E7;
+/* 按下背景 */
+}
+
+/* (例如 "画笔" 按钮) */
+QToolBar QToolButton:checkable:checked {
+    background-color: #E0F2F1;
+/* 选中的浅薄荷色 */
+    border: 1px solid #B2DFDB;
+}
+
+/* ============================================= */
+/* Layer 1: 左侧面板 (浅灰色背景) */
+/* ============================================= */
+
+/* 标签栏 (Tab bar) */
+QTabBar::tab {
+    background: transparent;
+/* 非选中标签透明 */
+    border: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 10px 20px;
+    color: #555555;
+    margin-right: 2px;
+}
+
+QTabBar::tab:hover {
+    background: #FDFDFD; /* 悬停时变亮 */
+}
+
+QTabBar::tab:selected {
+    background: #F4F6F7;
+/* 选中标签的背景 (匹配下方窗格) */
+    font-weight: bold;
+    color: #111111;
+}
+
+/* 标签内容窗格 (所有 Tab 共用) */
+QTabWidget::pane {
+    background-color: #F4F6F7;
+/* 浅灰色面板背景 */
+    border: 1px solid #DDE2E5;
+    border-radius: 6px;
+    border-top-left-radius: 0;
+/* 左上角由 TabBar 处理 */
+}
+
+/* ============================================= */
+/* Layer 2: 卡片 (白色浮动层) */
+/* ============================================= */
+
+/* 使滚动区域透明，以显示下方的 #F4F6F7 灰色背景 */
+QScrollArea {
+    border: none;
+    background-color: transparent;
+}
+/* 滚动区域内的 QWidget 同样透明 */
+QScrollArea > QWidget > QWidget {
+     background-color: transparent;
+}
+
+/* GroupBox 卡片 */
+QGroupBox {
+    background-color: #FFFFFF; /* 卡片使用白色 */
+    border: 1px solid #DDE2E5;
+/* 卡片边框 */
+    border-radius: 8px;
+    margin: 10px; /* 卡片与面板边缘的间距 */
+    padding: 10px;
+    margin-top: 12px;
+    font-weight: bold;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top center;
+    padding: 0 10px;
+    color: #006666;
+}
+
+/* 列表和日志 卡片 */
+QListWidget, QTextEdit {
+    background-color: #FFFFFF;
+/* 卡片使用白色 */
+    border: 1px solid #DDE2E5; /* 卡片边框 */
+    border-radius: 8px;
+    margin: 10px;
+/* 卡片与面板边缘的间距 */
+    padding: 5px;
+}
+
+QListWidget::item {
+    padding: 6px;
+    border-radius: 4px;
+}
+
+QListWidget::item:selected {
+    background-color: #208080; /* 主题色 */
+    color: white;
+}
+
+
+/* ============================================= */
+/* Layer 1: 中心图像视图 (深色内容区) */
+/* ============================================= */
+QGraphicsView {
+    background-color: #2D2D2D;
+/* 深色背景以突出图像 */
+    border: 1px solid #DDE2E5;
+    border-radius: 8px;
+}
+
+
+/* ============================================= */
+/* Layer 3: 交互控件 */
+/* ============================================= */
+
+/* 按钮 (保持主题色) */
+QPushButton {
+    background-color: #208080;
+    color: white;
+    border: none;
+    padding: 9px 18px;
+    border-radius: 6px;
+    min-height: 24px;
+}
+
+QPushButton:hover {
+    background-color: #2A9090;
+}
+
+QPushButton:pressed {
+    background-color: #1A7070;
+}
+
+QPushButton:disabled {
+    background-color: #BDBDBD;
+    color: #757575;
+}
+
+/* 输入框 */
+QLineEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #FFFFFF;
+    border: 1px solid #CDD2D5;
+/* 标准边框 */
+    border-radius: 6px;
+    padding: 7px;
+    selection-background-color: #208080;
+    selection-color: white;
+}
+
+/* 焦点状态 (使用主题色) */
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
+    border: 1px solid #208080;
+}
+
+/* 进度条 */
+QProgressBar {
+    border: 1px solid #DDE2E5;
+    border-radius: 4px;
+    text-align: center;
+    color: #334433;
+    background-color: #E6EBE6;
+}
+
+QProgressBar::chunk {
+    background-color: #208080;
+    border-radius: 4px;
+}
+
+/* 菜单栏 */
+QMenuBar {
+    background-color: #FFFFFF;
+    border: none;
+    padding: 2px;
+}
+QMenuBar::item {
+    padding: 4px 10px;
+    background: transparent;
+    border-radius: 4px;
+}
+QMenuBar::item:selected {
+    background: #E0E0E0;
+}
+QMenu {
+    background-color: #FFFFFF;
+    border: 1px solid #C0D0C0;
+    padding: 5px;
+}
+QMenu::item:selected {
+    background-color: #E0E0E0;
+}
+
+/* 滚动条 */
+QScrollBar:vertical {
+    border: none;
+    background: #F4F6F7;
+/* 匹配面板背景 */
+    width: 10px;
+    margin: 0px 0 0px 0;
+}
+QScrollBar::handle:vertical {
+    background: #C0D0C0;
+    min-height: 20px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #B0C0B0;
+}
+QScrollBar:horizontal {
+    border: none;
+    background: #F4F6F7;
+    height: 10px;
+    margin: 0px 0 0px 0;
+}
+QScrollBar::handle:horizontal {
+    background: #C0D0C0;
+    min-width: 20px;
+    border-radius: 5px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #B0C0B0;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    border: none;
+    background: none;
+    height: 0px;
+    width: 0px;
+}
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+}
+QToolBar QToolButton#btn_edit_mode:checked {
+    background-color: #E0F2F1;  /* 保持浅薄荷色背景 */
+    border: 1px solid #008080;  /* 核心修改：设置 1px 深青色实线边框，使其清晰可见 */
+    border-radius: 4px;         /* 保持圆角 */
+}
