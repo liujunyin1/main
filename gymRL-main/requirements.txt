@@ -1,0 +1,12 @@
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+gym
+swig
+gymnasium
+gymnasium[box2d]
+ale-py
+flappy-bird-gymnasium
+torch
+numpy
+tensorboard
+loguru
