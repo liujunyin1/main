@@ -1,4 +1,0 @@
------------train------------
-python
------------inference------------
-python step_2_inference.py --hiera-path /opt/data/private/SH/dataset/checkpoints/sam2_hiera_tiny.pt
